@@ -780,6 +780,7 @@
         </div>
     </div>
 
+    <script src="config.js"></script>
     <script>
         /* ================= 1. УПРАВЛЕНИЕ ФОТОГРАФИЯМИ И УПАКОВКА В INDEX.HTML ================= */
         const EXPECTED_PHOTOS = [
@@ -855,6 +856,7 @@
         function openPackagerModal() {
             renderPhotoChecklist();
             const modal = document.getElementById('packagerModal');
+            if (!modal) return;
             modal.classList.remove('hidden');
             modal.classList.add('flex');
         }
@@ -862,6 +864,7 @@
         function closePackagerModal(event) {
             if (event && event.target !== document.getElementById('packagerModal')) return;
             const modal = document.getElementById('packagerModal');
+            if (!modal) return;
             modal.classList.add('hidden');
             modal.classList.remove('flex');
         }
@@ -1071,9 +1074,13 @@
         }
 
         /* ================= 2. СЧЁТЧИК ПОЧТЕНИЯ И ЗОЛОТЫЕ ЧАСТИЦЫ ================= */
-        const COUNTER_URL = 'https://api.counterapi.dev/v1/semyon-bobrenok-enakievo-2026/respect';
+        // Адрес базы Firebase берётся из config.js (window.FIREBASE_DB_URL)
+        const DB_URL = String(window.FIREBASE_DB_URL || '').replace(/\/+$/, '');
+        const COUNTER_ENDPOINT = DB_URL + '/respect.json';
+        const COUNTER_CONFIGURED = /^https:\/\/[^\s]+$/.test(DB_URL) && DB_URL.indexOf('ВАШ') === -1;
         const STORAGE_KEY = 'semyon_bobrenok_respected_once';
-        let respectCount = 0;
+        let respectCount = null;   // null = число пока неизвестно
+        let respectBusy = false;
 
         const salutePhrases = [
             "Семён Бобренок одобрительно кивает из Енакиево.",
@@ -1083,6 +1090,20 @@
             "Стас и Адам подтверждают: вы человек чести."
         ];
 
+        // localStorage может быть недоступен (приватный режим, встроенные браузеры)
+        function storageGet(key) {
+            try { return localStorage.getItem(key); } catch (e) { return null; }
+        }
+        function storageSet(key, value) {
+            try { localStorage.setItem(key, value); } catch (e) {}
+        }
+
+        function renderRespect() {
+            const el = document.getElementById('respectCounter');
+            if (!el) return;
+            el.textContent = (typeof respectCount === 'number') ? respectCount.toLocaleString('ru-RU') : '—';
+        }
+
         function lockSaluteButton() {
             const btn = document.getElementById('saluteBtn');
             if (!btn) return;
@@ -1091,61 +1112,96 @@
             btn.innerHTML = '<span>✓</span><span>Почтение засвидетельствовано</span>';
         }
 
-        document.addEventListener('DOMContentLoaded', async () => {
-            const counterEl = document.getElementById('respectCounter');
-            if (localStorage.getItem(STORAGE_KEY)) {
-                lockSaluteButton();
+        // Золотые частицы вокруг точки клика
+        function spawnGoldParticles(x, y) {
+            for (let i = 0; i < 18; i++) {
+                const p = document.createElement('span');
+                const size = 4 + Math.random() * 6;
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 40 + Math.random() * 90;
+                p.className = 'gold-particle';
+                p.style.width = size + 'px';
+                p.style.height = size + 'px';
+                p.style.left = (x - size / 2) + 'px';
+                p.style.top = (y - size / 2) + 'px';
+                p.style.setProperty('--dx', (Math.cos(angle) * dist) + 'px');
+                p.style.setProperty('--dy', (Math.sin(angle) * dist) + 'px');
+                document.body.appendChild(p);
+                setTimeout(() => p.remove(), 1000);
             }
+        }
+
+        async function fetchRespect() {
+            const res = await fetch(COUNTER_ENDPOINT, { cache: 'no-store' });
+            if (!res.ok) throw new Error('HTTP ' + res.status);
+            const value = await res.json();
+            return (typeof value === 'number') ? value : 0;   // узла ещё нет -> 0
+        }
+
+        async function loadRespect() {
+            if (!COUNTER_CONFIGURED) { renderRespect(); return; }
             try {
-                const res = await fetch(COUNTER_URL);
-                if (res.ok) {
-                    const data = await res.json();
-                    if (typeof data.count === 'number') {
-                        respectCount = data.count;
-                        if (counterEl) counterEl.textContent = respectCount.toLocaleString('ru-RU');
-                    }
-                } else if (counterEl) {
-                    counterEl.textContent = '0';
-                }
+                respectCount = await fetchRespect();
             } catch (err) {
-                if (counterEl) counterEl.textContent = '0';
+                respectCount = null;
             }
+            renderRespect();
+        }
+
+        document.addEventListener('DOMContentLoaded', () => {
+            if (storageGet(STORAGE_KEY)) lockSaluteButton();
+            loadRespect();
         });
 
         async function giveRespect(event) {
-            if (localStorage.getItem(STORAGE_KEY)) {
-                lockSaluteButton();
+            if (storageGet(STORAGE_KEY)) { lockSaluteButton(); return; }
+            if (respectBusy) return;
+
+            if (!COUNTER_CONFIGURED) {
+                showToast('Счётчик не подключён: укажите адрес базы в config.js.');
                 return;
             }
 
-            localStorage.setItem(STORAGE_KEY, '1');
+            respectBusy = true;
+            const x = event && event.clientX;
+            const y = event && event.clientY;
+
+            // Сначала записываем голос на сервер. Серверный increment атомарен,
+            // поэтому одновременные голоса не затирают друг друга.
+            try {
+                const res = await fetch(COUNTER_ENDPOINT, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ '.sv': { increment: 1 } })
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+            } catch (err) {
+                respectBusy = false;
+                showToast('Не удалось записать голос. Попробуйте ещё раз чуть позже.');
+                return;
+            }
+
+            // Голос принят: запоминаем это в браузере и блокируем кнопку
+            storageSet(STORAGE_KEY, '1');
             lockSaluteButton();
 
-            respectCount++;
+            // Берём актуальное число с сервера (с учётом чужих голосов)
+            try {
+                respectCount = await fetchRespect();
+            } catch (err) {
+                if (typeof respectCount === 'number') respectCount++;
+            }
+            renderRespect();
+
             const counterEl = document.getElementById('respectCounter');
             if (counterEl) {
-                counterEl.textContent = respectCount.toLocaleString('ru-RU');
                 counterEl.classList.add('scale-125', 'text-gold-light');
                 setTimeout(() => counterEl.classList.remove('scale-125', 'text-gold-light'), 250);
             }
 
-            if (event && event.clientX) {
-                spawnGoldParticles(event.clientX, event.clientY);
-            }
-
-            const phrase = salutePhrases[Math.floor(Math.random() * salutePhrases.length)];
-            showToast(phrase);
-
-            try {
-                const res = await fetch(COUNTER_URL + '/up');
-                if (res.ok) {
-                    const data = await res.json();
-                    if (typeof data.count === 'number') {
-                        respectCount = data.count;
-                        if (counterEl) counterEl.textContent = respectCount.toLocaleString('ru-RU');
-                    }
-                }
-            } catch (err) {}
+            if (x || y) spawnGoldParticles(x, y);
+            showToast(salutePhrases[Math.floor(Math.random() * salutePhrases.length)]);
+            respectBusy = false;
         }
 
         let toastTimer;
@@ -1372,61 +1428,4 @@
         }
     </script>
 
-
-      <script>
-        (function() {
-          // The root element's background fills the whole page. As in CSS,
-          // the body's background is used when the root element has none.
-          function getPageBackgroundColor() {
-            var docStyle = window.getComputedStyle(document.documentElement);
-            var color = docStyle.backgroundColor;
-            if ((color === 'rgba(0, 0, 0, 0)' || color === 'transparent') &&
-                docStyle.backgroundImage === 'none' && document.body) {
-              color = window.getComputedStyle(document.body).backgroundColor;
-            }
-            return color || '';
-          }
-
-          var lastReportedColor = '';
-          function reportBackgroundColor() {
-            try {
-              var color = getPageBackgroundColor();
-              if (color === lastReportedColor) return;
-              lastReportedColor = color;
-              window.parent.postMessage({
-                type: 'ATARI_CODE_EMBED_BACKGROUND_COLOR',
-                backgroundColor: color
-              }, '*');
-            } catch (e) {}
-          }
-
-          // The page background usually changes through an attribute on html
-          // or body (for example a theme class), a style sheet in head, or the
-          // system color scheme.
-          if (typeof MutationObserver !== 'undefined') {
-            var observer = new MutationObserver(reportBackgroundColor);
-            observer.observe(document.documentElement, {attributes: true});
-            if (document.body) {
-              observer.observe(document.body, {attributes: true});
-            }
-            if (document.head) {
-              observer.observe(document.head, {
-                attributes: true,
-                childList: true,
-                subtree: true,
-                characterData: true
-              });
-            }
-          }
-          var colorSchemeQuery =
-              window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
-          if (colorSchemeQuery && colorSchemeQuery.addEventListener) {
-            colorSchemeQuery.addEventListener('change', reportBackgroundColor);
-          }
-          window.addEventListener('load', reportBackgroundColor);
-          window.addEventListener('transitionend', reportBackgroundColor);
-          window.addEventListener('animationend', reportBackgroundColor);
-          reportBackgroundColor();
-        })();
-      </script>
     </body></html>
